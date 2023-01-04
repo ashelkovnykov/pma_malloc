@@ -2392,7 +2392,6 @@ done:
 
 static int ESECT mdb_env_share_locks(MDB_env *env, int *excl);
 
-// HERE
 int
 mdb_txn_commit(MDB_txn *txn)
 {
