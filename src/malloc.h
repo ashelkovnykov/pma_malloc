@@ -23,6 +23,18 @@ int
 pma_init(const char *path);
 
 /**
+ * TODO
+ */
+int
+pma_load(const char *path);
+
+/**
+ * TODO
+ */
+int
+pma_close(uint64_t epoch, uint64_t event);
+
+/**
  * Allocate a new block of memory in the PMA
  *
  * @param size  Size in bytes to allocate
@@ -42,3 +54,9 @@ pma_malloc(size_t size);
  */
 void
 pma_free(void *address);
+
+/**
+ * TODO
+ */
+int
+pma_sync(uint64_t epoch, uint64_t event);
