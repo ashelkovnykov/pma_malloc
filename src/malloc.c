@@ -47,25 +47,6 @@
  */
 #define PMA_BITMAP_BITS       (8 * sizeof(uint8_t))
 
-/**
- * Automatic disk flush dirty page limit
- *
- * TODO
- */
-//#define PMA_FLUSH_PAGE_LIMIT  128
-
-/**
- * Automatic disk flush event limit
- *
- * TODO
- */
-//#define PMA_FLUSH_EVENT_LIMIT 128
-
-/**
- * Abort on non-fatal error
- */
-#define PMA_ABORT             0
-
 //==============================================================================
 // AUTO MACROS (do not manually configure)
 //==============================================================================
@@ -119,12 +100,12 @@
 /**
  * Convert pointer to index in page directory
  */
-#define PTR_TO_INDEX(foo)     ((((uint64_t)foo) - ((uint64_t)_pma_state->metadata.arena_start)) >> PMA_PAGE_SHIFT)
+#define PTR_TO_INDEX(foo)     ((((uint64_t)foo) - ((uint64_t)_pma_state->metadata->arena_start)) >> PMA_PAGE_SHIFT)
 
 /**
- * TODO - documentation
+ * Convert index in page directory to pointer
  */
-#define INDEX_TO_PTR(foo)     (void *)((char *)_pma_state->metadata.arena_start + (foo * PMA_PAGE_SIZE))
+#define INDEX_TO_PTR(foo)     (void *)((char *)_pma_state->metadata->arena_start + (foo * PMA_PAGE_SIZE))
 
 /**
  * Flags to use for all mmap operations, excluding initial metadata page mapping
@@ -159,20 +140,25 @@
 /**
  * See SharedPageHeader for explanation
  */
-#define PMA_BITMAP_SIZE       27
+#define PMA_BITMAP_SIZE       32
 
 /**
- * TODO
+ * Max number of dpage offsets that can fit into a cache of free dpages stored
+ * as an array in a single page (when factoring in space used by metadata).
+ *
+ * 511 for 4 KiB page
  */
-#define PMA_DPAGE_CACHE_SIZE  511
+#define PMA_DPAGE_CACHE_SIZE  ((PMA_PAGE_SIZE - sizeof(DPageCache)) / sizeof(uint64_t))
 
 /**
+ * Max number of dirty page entries that can be stored in the extra space of the
+ * metadata page. Caching the dirty page entries and writing them as a part of
+ * the metadata allows us to solve the problem of desynchronization between the
+ * metadata and page directory without using B+ Trees.
  *
- *    (4096 - (20 * 8)) / 24 = 164
- *
- * TODO
+ * 164 for 4 KiB page
  */
-#define PMA_DIRTY_PAGE_LIMIT  164
+#define PMA_DIRTY_PAGE_LIMIT  ((PMA_PAGE_SIZE - sizeof(Metadata)) / sizeof(DirtyPageEntry))
 
 /**
  * Default settings for new PMA backing files
@@ -199,26 +185,47 @@
 #define PMA_INIT_SNAP_SIZE    1073741824
 #define PMA_INIT_DIR_SIZE     4194304
 
-// TODO
+/**
+ * Maximum possible size of the page directory. This is how big the page
+ * directory would need to be to reach all addressable virtual memory in Linux.
+ */
 #define PMA_MAXIMUM_DIR_SIZE  365072220160
 
-// TODO
+/**
+ * Base address for the PMA. Lowest address not reserved by Linux.
+ */
 #define PMA_SNAPSHOT_ADDR     0x10000
 
 /**
- * 4 GiB in bytes
- *
- * TODO: documentation
+ * Increment block size for resizing the snapshot backing file (4 GiB in bytes).
+ * This is just the default increment; the backing file is extended by the
+ * smallest multiple of this value sufficient to fit the new allocation.
  */
 #define PMA_SNAP_RESIZE_INC   4294967296
 
+//==============================================================================
+// HELPER MACROS
+//==============================================================================
+
 /**
- * Logging helper macros
+ * Log error and return failure during new PMA bootstrap
  */
-#define INIT_ERROR            { err_line = __LINE__; goto init_error; }
-#define LOAD_ERROR            { err_line = __LINE__; goto load_error; }
-#define ERROR(foo)            _pma_error(foo, address, __LINE__)
-#define WARNING(foo)          _pma_warning(foo, address, __LINE__)
+#define INIT_ERROR    do { err_line = __LINE__; goto init_error; } while(0)
+
+/**
+ * Log error and return failure during existing PMA load
+ */
+#define LOAD_ERROR    do { err_line = __LINE__; goto load_error; } while(0)
+
+/**
+ * Log error and return failure during PMA sync
+ */
+#define SYNC_ERROR    do { err_line = __LINE__; goto sync_error; } while(0)
+
+/**
+ * Log warning to console
+ */
+#define WARNING(foo)  _pma_warning(foo, address, __LINE__)
 
 //==============================================================================
 // TYPES
@@ -263,7 +270,7 @@ typedef struct _pma_page_dir_t {
  * size of a hard-coded bitmap, given the number of slots available in a page
  * after subtracting the header, is 32 bytes:
  *
- *    X = max # slots in page (16-byte slots)
+ *    X = max # slots in page (min slot size = 16-bytes)
  *    (4096 - (11 + ceil(X/8))) > 16X
  *    (4096 - (11 + (X/8) + 1)) > 16X
  *                   4084 - X/8 > 16X
@@ -274,63 +281,80 @@ typedef struct _pma_page_dir_t {
  *    bitmap bytes = ceil(253 div 8) = ceil(31.625) = 32
  *
  * However, the alignment adds padding bytes in between the scalar and array
- * struct members. In this case, this doesn't affect the total number of
+ * struct members:
+ *    (253 * 16) + 11 + 5 + 32 = 4096
+ *
+ * In this case, this doesn't affect the total number of
  * available slots, but it could if the members of the SharedPageHeader change.
  */
 typedef struct _pma_shared_page_t {
-  struct _pma_shared_page_t  *next;      // Next shared page; forms a stack as additional pages of the same slot size are allocated
-  uint8_t                     dirty;
-//   void                      *page;    // Pointer to the first data slot      // TODO: but then why does shift exist?
-  uint8_t                     size;      // Slot size for this page = 2^size
-//  uint8_t                     shift;   // Byte shift for actual slot data     // TODO: don't need this if we hardcode min size as min alloc as 16U
-//  uint8_t                     total;   // Total number of slots in page       // TODO: can't actually find a use for this info, other than sanity asserts
-  uint8_t                     free;      // Number of free slots in page
-  uint8_t                     bits[32];  // Bitmap of which slots are free
+  struct _pma_shared_page_t  *next;   // Next shared page; forms a stack as additional pages of the same slot size are allocated
+  uint8_t                     dirty;  // Dirty bit; necessary when allocating twice to the same page in one event
+  uint8_t                     size;   // Slot size for this page = 2^size
+  uint8_t                     free;   // Number of free slots in page
+  uint8_t                     bits[PMA_BITMAP_SIZE];  // Bitmap of which slots are free
 } SharedPageHeader;
 
 /**
- * TODO: Documentation
+ * Update to page directory state for an allocation. A limited number of such
+ * updates can be stored behind the header in the metadata page, allowing
+ * simultaneous copy-on-write semantics for the metadata and updates to the page
+ * directory without a B+ Tree.
  */
 typedef struct _pma_dirty_page_entry_t {
-  uint64_t    index;      // TODO
-  uint64_t    offset;     // TODO
-  uint32_t    num_pages;  // Total number of pages marked dirty
-  PageStatus  status;     // TODO
+  uint64_t    index;      // Index in page directory
+  uint64_t    offset;     // Offset on disk backing file
+  uint32_t    num_pages;  // Number of pages marked dirty (for multi-page allocations)
+  PageStatus  status;     // Page status after sync
 } DirtyPageEntry;
 
 /**
- * Free page run node
+ * Free page cache node
  *
- * Nodes form a bidirectional linked list storing info about runs of free pages
- * (pages mmapped to disk, but with nothing allocated on them).
+ * Nodes form a linked list of single free pages. A free page is an allocated
+ * pages already backed by disk, but available for use (their old values were
+ * freed).
  *
- * TODO: Documentation
+ * Free pages are purposely not merged into runs, because two pages being
+ * adjacent in virtual memory does not mean that they are adjacent on disk, and
+ * disk locality is preferable for multi-page allocations.
+ *
+ * The caches for free single pages and free multi-page runs are split to save
+ * time: any free page will do for a shared page or single page allocation, but
+ * exact ranges are preferable for multi-page allocations.
  */
 typedef struct _pma_single_page_cache_t {
-  struct _pma_single_page_cache_t  *next;   // Next node in list
-  void                             *page;   // Pointer to free page
+  struct _pma_single_page_cache_t  *next; // Next node in list
+  void                             *page; // Pointer to free page
 } SinglePageCache;
 
 /**
- * Free page run node
+ * Free page run cache node
  *
- * Nodes form a bidirectional linked list storing info about runs of free pages
- * (pages mmapped to disk, but with nothing allocated on them).
+ * Nodes form a linked list of free multi-page runs. A free page is an allocated
+ * pages already backed by disk, but available for use (their old values were
+ * freed).
  *
- * TODO: Documentation
+ * Free pages are purposely not merged into runs, because two pages being
+ * adjacent in virtual memory does not mean that they are adjacent on disk, and
+ * disk locality is preferable for multi-page allocations.
+ *
+ * The caches for free single pages and free multi-page runs are split to save
+ * time: any free page will do for a shared page or single page allocation, but
+ * exact ranges are preferable for multi-page allocations.
  */
 typedef struct _pma_page_run_cache_t {
-  struct _pma_page_run_cache_t *next;     // Next node in list
-  void                         *page;     // Pointer to start of page run
-  uint64_t                      length;   // Number of pages in run
+  struct _pma_page_run_cache_t *next;   // Next node in list
+  void                         *page;   // Pointer to start of page run
+  uint64_t                      length; // Number of pages in run
 } PageRunCache;
 
 /**
  * Free dpage run node
  *
- * Nodes form a bidirectional linked list storing info about runs of free dpages
- * (page-sized blocks already allocated to the snapshot file on disk but with no
- * memory mmapped to them).
+ * A dpage is a page-sized block already allocated to the snapshot file on disk
+ * but without memory mapped to it. Reusing free dpages allows allocations
+ * without growing the backing file.
  *
  * It's possible to simplify this cache by turning it into a stack of individual
  * free dpages. However, since multi-page allocations will *never* move,
@@ -338,16 +362,13 @@ typedef struct _pma_page_run_cache_t {
  * but also allows us to take advantage of locality caching: typically, when the
  * OS experiences a page miss, the OS/hardware will fetch not just the missing
  * page, but also several of the following (nearby?) pages.
- *
- * TODO: Documentation
- * TODO: size needs to be updated during metadata sync; it stores the "safe" size of the entries
  */
 typedef struct _pma_free_dpage_cache_t {
-  uint16_t  dirty;                        // Has dpage cache already been copied to a new page with PROT_WRITE
-  uint16_t  size;                         // Number of entries in queue
-  uint16_t  head;                         // Index of front of queue
-  uint16_t  tail;                         // Index of back of queue
-  uint64_t  queue[PMA_DPAGE_CACHE_SIZE];  // Cache of free dpages as queue
+  uint8_t   dirty;    // Has dpage cache already been copied to a new page with PROT_WRITE
+  uint16_t  size;     // Number of entries in queue
+  uint16_t  head;     // Index of front of queue
+  uint16_t  tail;     // Index of back of queue
+  uint64_t  queue[];  // Cache of free dpages as queue; array of size PMA_DPAGE_CACHE_SIZE
 } DPageCache;
 
 /**
@@ -355,33 +376,36 @@ typedef struct _pma_free_dpage_cache_t {
  */
 typedef struct _pma_metadata_t {
   uint64_t          magic_code;       // Stamp identifying a file as a New Mars PMA file
-  uint32_t          checksum;         // TODO
+  uint32_t          checksum;         // Checksum value to detect corruption
   uint32_t          version;          // Version of Vere (New Mars?) used to produce the backing file
   uint64_t          epoch;            // Epoch ID of the most recently processed event
   uint64_t          event;            // ID of the most recently processed event
   void             *arena_start;      // Beginning of mapped address space
   void             *arena_end;        // End of mapped address space (first address beyond mapped range)
   SharedPageHeader *shared_pages[PMA_MAX_SHARED_SHIFT]; // Shared allocation pages
-  DPageCache       *dpage_cache;      // TODO
-  uint64_t          snapshot_size;    // TODO
-  uint64_t          next_offset;      // TODO
-  uint8_t           num_dirty_pages;  // TODO
-  DirtyPageEntry    dirty_pages[PMA_DIRTY_PAGE_LIMIT];  // Array of changes not yet synced to page directory (exactly 164)
+  DPageCache       *dpage_cache;      // Cache of free dpges as queue
+  uint64_t          snapshot_size;    // Size of the backing file
+  uint64_t          next_offset;      // Next open dpage in the backing file
+  uint8_t           num_dirty_pages;  // Counter of dirty page entries
+  DirtyPageEntry    dirty_pages[];    // Queue of changes not yet synced to page directory
 } Metadata;
 
 /**
  * Struct containing global data used by PMA
  *
- * TODO: Documentation
+ * Containment zone for what would otherwise be global variables. Global state
+ * stored in struct and passed around to functions that need it. Data that
+ * could otherwise go into the metadata, but is recomputable as derived state
+ * should go here.
  */
 typedef struct _pma_global_state_t {
-  Metadata          metadata;         // Metadata for current status of event snapshot
-  uint64_t          meta_page_offset; // TODO
-  PageDir           page_directory;   // TODO
+  Metadata         *metadata;         // Metadata; contains current status of snapshot
+  uint64_t          meta_page_offset; // Offset on disk of next metadata page to be replaced
+  PageDir           page_directory;   // Page directory; maps virtual memory addresses to pages on disk
   int               snapshot_fd;      // File descriptor for PMA backing file
-  int               page_dir_fd;      // TODO
-  SinglePageCache  *free_pages;       // TODO
-  PageRunCache     *free_page_runs;   // TODO
+  int               page_dir_fd;      // File descriptor for page directory
+  SinglePageCache  *free_pages;       // Cache of free single pages
+  PageRunCache     *free_page_runs;   // Cache of free multi-page runs
 } State;
 
 //==============================================================================
@@ -401,17 +425,16 @@ void     *_pma_malloc_multi_pages(uint64_t num_pages);
 void     *_pma_get_cached_pages(uint64_t num_pages);
 void     *_pma_get_new_page(PageStatus status);
 void     *_pma_get_new_pages(uint64_t num_pages);
-void      _pma_free_pages(void *address);
-void      _pma_free_bytes(void *address);
+int       _pma_free_pages(void *address);
+int       _pma_free_bytes(void *address);
 int       _pma_copy_shared_page(void *address);
 uint64_t  _pma_get_single_dpage(void);
 uint64_t  _pma_get_cached_dpage(void);
 int       _pma_copy_dpage_cache(void);
 uint64_t  _pma_get_disk_dpage(void);
-void      _pma_copy_page(void *address, uint64_t offset, PageStatus status, int fd);  // TODO: return pass/fail boolean?
+void      _pma_copy_page(void *address, uint64_t offset, PageStatus status, int fd);
 void      _pma_mark_page_dirty(uint64_t index, uint64_t offset, PageStatus status, uint32_t num_pages);
 int       _pma_extend_snapshot_file(uint64_t multiplier);
-void      _pma_error(const char *p, void *a, int l);
 void      _pma_warning(const char *p, void *a, int l);
 
 //==============================================================================
@@ -423,6 +446,10 @@ State *_pma_state = NULL;
 //==============================================================================
 // PUBLIC FUNCTIONS
 //==============================================================================
+
+// TODO: Replace errno codes with our own error codes
+
+// TODO: Inconsistent abort() calls; should better define when an error is fatal
 
 int
 pma_init(const char *path) {
@@ -565,51 +592,54 @@ pma_init(const char *path) {
   // Setup metadata
   //
 
+  _pma_state->metadata = malloc(PMA_PAGE_SIZE);
+  if (!_pma_state->metadata) INIT_ERROR;
+
   // Initialize simple metadata state
-  _pma_state->metadata.magic_code = PMA_MAGIC_CODE;
-  _pma_state->metadata.checksum   = 0;
-  _pma_state->metadata.version    = PMA_DATA_VERSION;
-  _pma_state->metadata.epoch      = 0;
-  _pma_state->metadata.event      = 0;
+  _pma_state->metadata->magic_code = PMA_MAGIC_CODE;
+  _pma_state->metadata->checksum   = 0;
+  _pma_state->metadata->version    = PMA_DATA_VERSION;
+  _pma_state->metadata->epoch      = 0;
+  _pma_state->metadata->event      = 0;
 
   // Initialize shared pages stacks
   for(uint8_t i = 0; i < PMA_MAX_SHARED_SHIFT; ++i) {
-    _pma_state->metadata.shared_pages[i] = NULL;
+    _pma_state->metadata->shared_pages[i] = NULL;
   }
 
   // Initialize dirty page array
   for(uint8_t i = 0; i < PMA_DIRTY_PAGE_LIMIT; ++i) {
-    _pma_state->metadata.dirty_pages[i].index     = 0;
-    _pma_state->metadata.dirty_pages[i].offset    = 0;
-    _pma_state->metadata.dirty_pages[i].num_pages = 0;
+    _pma_state->metadata->dirty_pages[i].index     = 0;
+    _pma_state->metadata->dirty_pages[i].offset    = 0;
+    _pma_state->metadata->dirty_pages[i].num_pages = 0;
   }
-  _pma_state->metadata.num_dirty_pages = 0;
+  _pma_state->metadata->num_dirty_pages = 0;
 
   // Initialize snapshot page info
-  _pma_state->metadata.snapshot_size  = PMA_INIT_SNAP_SIZE;
-  _pma_state->metadata.next_offset    = meta_bytes;
+  _pma_state->metadata->snapshot_size  = PMA_INIT_SNAP_SIZE;
+  _pma_state->metadata->next_offset    = meta_bytes;
 
   // Initialize arena start pointer
-  _pma_state->metadata.arena_start  = (void *)PMA_SNAPSHOT_ADDR;
+  _pma_state->metadata->arena_start  = (void *)PMA_SNAPSHOT_ADDR;
 
   // Manually allocate a page for the dpage cache
-  _pma_state->metadata.dpage_cache = mmap(
-      _pma_state->metadata.arena_start,
+  _pma_state->metadata->dpage_cache = mmap(
+      _pma_state->metadata->arena_start,
       PMA_PAGE_SIZE,
       PROT_READ | PROT_WRITE,
       MAP_SHARED | MAP_FIXED_NOREPLACE,
       snapshot_fd,
       meta_bytes);
-  if (_pma_state->metadata.dpage_cache == MAP_FAILED) INIT_ERROR;
+  if (_pma_state->metadata->dpage_cache == MAP_FAILED) INIT_ERROR;
 
   // Initialize arena end pointer
-  _pma_state->metadata.arena_end = (void*)((char*)_pma_state->metadata.arena_start + PMA_PAGE_SIZE);
+  _pma_state->metadata->arena_end = (void*)((char*)_pma_state->metadata->arena_start + PMA_PAGE_SIZE);
 
   // Setup initial dpage cache values
-  _pma_state->metadata.dpage_cache->dirty = 0;
-  _pma_state->metadata.dpage_cache->size  = 0;
-  _pma_state->metadata.dpage_cache->head  = 0;
-  _pma_state->metadata.dpage_cache->tail  = 0;
+  _pma_state->metadata->dpage_cache->dirty = 0;
+  _pma_state->metadata->dpage_cache->size  = 0;
+  _pma_state->metadata->dpage_cache->head  = 0;
+  _pma_state->metadata->dpage_cache->tail  = 0;
 
   //
   // Setup page directory
@@ -643,7 +673,7 @@ pma_init(const char *path) {
 
   // Sync dpage cache
   err = msync(
-      _pma_state->metadata.dpage_cache,
+      _pma_state->metadata->dpage_cache,
       PMA_PAGE_SIZE,
       MS_SYNC);
   if (err) INIT_ERROR;
@@ -656,7 +686,7 @@ pma_init(const char *path) {
   if (err) INIT_ERROR;
 
   // Compute checksum for metadata
-  _pma_state->metadata.checksum = crc_32(
+  _pma_state->metadata->checksum = crc_32(
       (const unsigned char *)(&(_pma_state->metadata)),
       PMA_PAGE_SIZE);
 
@@ -673,7 +703,7 @@ pma_init(const char *path) {
 
   // Remove PROT_WRITE permissions from snapshot and page directory
   if (mprotect(meta_pages, meta_bytes, PROT_READ)) INIT_ERROR;
-  if (mprotect(_pma_state->metadata.dpage_cache, PMA_PAGE_SIZE, PROT_READ)) INIT_ERROR;
+  if (mprotect(_pma_state->metadata->dpage_cache, PMA_PAGE_SIZE, PROT_READ)) INIT_ERROR;
   if (mprotect(page_dir, PMA_PAGE_SIZE, PROT_READ)) INIT_ERROR;
 
   //
@@ -687,16 +717,16 @@ pma_init(const char *path) {
   return 0;
 
 init_error:
-  err = errno;
-  fprintf(stderr, "(L%d) Initialization error: %s\n", err_line, strerror(errno));
+  fprintf(stderr, "(L%d) PMA initialization error: %s\n", err_line, strerror(errno));
 
   munmap(meta_pages, meta_bytes);
   munmap(page_dir, PMA_INIT_DIR_SIZE);
   if (snapshot_fd) close(snapshot_fd);
   if (page_dir_fd) close(page_dir_fd);
   free((void*)filepath);
+  free((void*)_pma_state);
 
-  exit(err);
+  return -1;
 }
 
 int
@@ -753,9 +783,9 @@ pma_load(const char *path) {
   //
 
   // Read magic code
-  err = read(snapshot_fd, (void*)(&_pma_state->metadata.magic_code), sizeof(uint64_t));
-  if ((err != -1) || (_pma_state->metadata.magic_code != PMA_MAGIC_CODE)) {
-    errno = EILSEQ; // TODO: EPROTO instead?
+  err = read(snapshot_fd, (void*)(&_pma_state->metadata->magic_code), sizeof(uint64_t));
+  if ((err != -1) || (_pma_state->metadata->magic_code != PMA_MAGIC_CODE)) {
+    errno = EILSEQ;
     LOAD_ERROR;
   }
 
@@ -793,10 +823,10 @@ pma_load(const char *path) {
   _pma_state->meta_page_offset = (newer_page == meta_pages) ? PMA_PAGE_SIZE : 0;
 
   // Update page directory using metadata dirty page list
-  err = _pma_sync_dirty_pages(page_dir_fd, _pma_state->metadata.num_dirty_pages, _pma_state->metadata.dirty_pages);
+  err = _pma_sync_dirty_pages(page_dir_fd, _pma_state->metadata->num_dirty_pages, _pma_state->metadata->dirty_pages);
   if (err) LOAD_ERROR;
 
-  _pma_state->metadata.num_dirty_pages = 0;
+  _pma_state->metadata->num_dirty_pages = 0;
 
   //
   // Load page directory
@@ -884,7 +914,6 @@ pma_load(const char *path) {
         // While pages have FOLLOW status, scan forward
         ++index;
         while (_pma_state->page_directory.entries[index].status == FOLLOW) {
-          // XX
           assert(_pma_state->page_directory.entries[index].offset == (_pma_state->page_directory.entries[index - 1].offset + PMA_PAGE_SIZE));
 
           ++count;
@@ -925,7 +954,7 @@ pma_load(const char *path) {
   // Done
   //
 
-  // XX: Check version number, possibly upgrade
+  // TODO: check version number, possibly upgrade
 
   // Clean up
   munmap(meta_pages, meta_bytes);
@@ -934,17 +963,17 @@ pma_load(const char *path) {
   return 0;
 
 load_error:
-  err = errno;
-  fprintf(stderr, "(L%d) Error loading from %s: %s\n", err_line, path, strerror(errno));
+  fprintf(stderr, "(L%d) Error loading PMA from %s: %s\n", err_line, path, strerror(errno));
 
   munmap(meta_pages, meta_bytes);
   munmap(_pma_state->page_directory.entries, PMA_MAXIMUM_DIR_SIZE);
-  munmap(_pma_state->metadata.arena_start, ((uint64_t)_pma_state->metadata.arena_end - (uint64_t)_pma_state->metadata.arena_start));
+  munmap(_pma_state->metadata->arena_start, ((uint64_t)_pma_state->metadata->arena_end - (uint64_t)_pma_state->metadata->arena_start));
   if (snapshot_fd) close(snapshot_fd);
   if (page_dir_fd) close(page_dir_fd);
   free((void*)filepath);
+  free((void*)_pma_state);
 
-  exit(err);
+  return -1;
 }
 
 int
@@ -958,11 +987,14 @@ pma_close(uint64_t epoch, uint64_t event) {
   munmap(_pma_state->page_directory.entries, PMA_MAXIMUM_DIR_SIZE);
 
   // Unmap snapshot
-  munmap(_pma_state->metadata.arena_start, _pma_state->metadata.snapshot_size);
+  munmap(_pma_state->metadata->arena_start, _pma_state->metadata->snapshot_size);
 
   // Close file descriptors
   close(_pma_state->page_dir_fd);
   close(_pma_state->snapshot_fd);
+
+  // Free PMA state
+  free((void*)_pma_state);
 
   return 0;
 }
@@ -986,71 +1018,75 @@ pma_malloc(size_t size) {
 
   /* MALLOC_UNLOCK */
 
-  // TODO: Document that this could be NULL but errno should be set
   return result;
 }
 
-void
+int
 pma_free(void *address) {
   uint64_t  index;
 
   // TODO: This is legal for POSIX free, but would this ever happen for pma_free?
-  if (address == NULL) return;
+  if (address == NULL) return 0;
 
-  // TODO: Should these error?
-  if (address < _pma_state->metadata.arena_start) {
+  if (address < _pma_state->metadata->arena_start) {
     WARNING("address too low to make sense");
-    return;
+    errno = EINVAL;
+    return -1;
   }
-  if (address >= _pma_state->metadata.arena_end) {
+  if (address >= _pma_state->metadata->arena_end) {
     WARNING("address too high to make sense");
-    return;
+    errno = EINVAL;
+    return -1;
   }
-  if (address >= _pma_state->metadata.arena_end) {
+  if (address >= _pma_state->metadata->arena_end) {
     WARNING("address was never allocated");
-    return;
+    errno = EINVAL;
+    return -1;
   }
 
   index = PTR_TO_INDEX(address);
-
   switch (_pma_state->page_directory.entries[index].status) {
     case UNALLOCATED:
       // Something has definitely gone wrong if an address between arena_start
       // and arena_end, with an index between 0 and next_free_index is
       // unallocated
-      ERROR("address marked unallocated");
-      break;
+      WARNING("address marked unallocated");
+      errno = EINVAL;
+      return -1;
 
     case FREE:
       WARNING("address already free");
-      break;
+      errno = EINVAL;
+      return -1;
 
     case SHARED:
-      _pma_free_bytes(address);
-      break;
+      return _pma_free_bytes(address);
 
     case FIRST:
-      _pma_free_pages(address);
-      break;
+      return _pma_free_pages(address);
 
     case FOLLOW:
-      ERROR("address points to middle of multi-page allocation");
-      break;
+      WARNING("address points to middle of multi-page allocation");
+      errno = EINVAL;
+      return -1;
   }
+
+  return 0;
 }
 
 int
 pma_sync(uint64_t epoch, uint64_t event) {
-  DPageCache *dpage_cache = _pma_state->metadata.dpage_cache;
+  DPageCache *dpage_cache = _pma_state->metadata->dpage_cache;
   ssize_t     bytes_out;
   int         err;
+  int         err_line;
 
   // Epoch & event may only increase
   if (
-      (epoch < _pma_state->metadata.epoch) ||
-      ((epoch == _pma_state->metadata.epoch) && (event <= _pma_state->metadata.event))) {
+      (epoch < _pma_state->metadata->epoch) ||
+      ((epoch == _pma_state->metadata->epoch) && (event <= _pma_state->metadata->event))) {
     errno = EINVAL;
-    goto sync_error;
+    return -1;
   }
 
   // Clear dpage cache dirty bit and compute new size
@@ -1060,57 +1096,58 @@ pma_sync(uint64_t epoch, uint64_t event) {
   }
 
   // Sync dirty pages
-  for (uint8_t i = 0; i < _pma_state->metadata.num_dirty_pages; ++i) {
-    void     *address = INDEX_TO_PTR(_pma_state->metadata.dirty_pages[i].index);
-    uint64_t  bytes = (_pma_state->metadata.dirty_pages[i].num_pages * PMA_PAGE_SIZE);
+  for (uint8_t i = 0; i < _pma_state->metadata->num_dirty_pages; ++i) {
+    void     *address = INDEX_TO_PTR(_pma_state->metadata->dirty_pages[i].index);
+    uint64_t  bytes = (_pma_state->metadata->dirty_pages[i].num_pages * PMA_PAGE_SIZE);
 
     // Clear dirty bit for shared pages
-    if (_pma_state->metadata.dirty_pages[i].status == SHARED) {
+    if (_pma_state->metadata->dirty_pages[i].status == SHARED) {
       ((SharedPageHeader*)address)->dirty = 0;
     }
 
     err = msync(address, bytes, MS_SYNC);
-    if (err) goto sync_error;
+    if (err) SYNC_ERROR;
 
-    if (mprotect(address, bytes, PROT_READ)) goto sync_error;
+    if (mprotect(address, bytes, PROT_READ)) SYNC_ERROR;
   }
 
   // Compute checksum
-  _pma_state->metadata.epoch = epoch;
-  _pma_state->metadata.event = event;
-  _pma_state->metadata.checksum = 0;
-  _pma_state->metadata.checksum = crc_32(
+  _pma_state->metadata->epoch = epoch;
+  _pma_state->metadata->event = event;
+  _pma_state->metadata->checksum = 0;
+  _pma_state->metadata->checksum = crc_32(
       (const unsigned char *)(&(_pma_state->metadata)),
       PMA_PAGE_SIZE);
 
   // Sync metadata
   bytes_out = pwrite(
       _pma_state->snapshot_fd,
-      (const void *)(&(_pma_state->metadata)),
+      (const void *)(_pma_state->metadata),
       PMA_PAGE_SIZE,
       _pma_state->meta_page_offset);
-  if (bytes_out != PMA_PAGE_SIZE) goto sync_error;
+  if (bytes_out != PMA_PAGE_SIZE) SYNC_ERROR;
 
   _pma_state->meta_page_offset = _pma_state->meta_page_offset ? 0 : PMA_PAGE_SIZE;
 
   // Sync dirty pages in page directory
   err = _pma_sync_dirty_pages(
       _pma_state->page_dir_fd,
-      _pma_state->metadata.num_dirty_pages,
-      _pma_state->metadata.dirty_pages);
-  if (err) goto sync_error;
+      _pma_state->metadata->num_dirty_pages,
+      _pma_state->metadata->dirty_pages);
+  if (err) SYNC_ERROR;
 
   // Update free page caches
-  err = _pma_update_free_pages(_pma_state->metadata.num_dirty_pages, _pma_state->metadata.dirty_pages);
-  if (err) goto sync_error;
+  err = _pma_update_free_pages(_pma_state->metadata->num_dirty_pages, _pma_state->metadata->dirty_pages);
+  if (err) SYNC_ERROR;
 
   // Reset dirty page array
-  _pma_state->metadata.num_dirty_pages = 0;
+  _pma_state->metadata->num_dirty_pages = 0;
 
-  // TODO: Should sync failure be a fatal error?
   return 0;
 
 sync_error:
+  fprintf(stderr, "(L%d) Error syncing PMA: %s\n", err_line, strerror(errno));
+
   return -1;
 }
 
@@ -1118,19 +1155,31 @@ sync_error:
 // PRIVATE FUNCTIONS
 //==============================================================================
 
+/**
+ * Verify that the checksum of a metadata page is valid
+ *
+ * Corruption or malicious interference is rare, so we assume that the checksum
+ * is correct and copy it into the global state in advance, then confirm its
+ * correctness there.
+ *
+ * @param meta_page  Pointer to a metadata page loaded from disk
+ *
+ * @return  Boolean (as int) for whether checksums match or not
+ */
 int
 _pma_verify_checksum(Metadata *meta_page) {
   uint32_t checksum;
 
-  // Copy metadata in advance of using it, since: 1) we expect the checksum to be valid; 2) we need to set the value of
-  // the checksum in the metadata to 0.
+  // Copy metadata in advance of using it, since: 1) we expect the checksum to
+  // be valid; 2) we need to set the value of the checksum in the metadata to 0.
   memcpy(
       (void*)(&(_pma_state->metadata)),
       (const void *)meta_page,
       PMA_PAGE_SIZE);
 
-  // Since we're computing the checksum on the object which itself includes the checksum, we treat the checksum as 0.
-  _pma_state->metadata.checksum = 0;
+  // Since we're computing the checksum on the object which itself includes the
+  // checksum, we treat the checksum as 0.
+  _pma_state->metadata->checksum = 0;
 
   // Compute checksum
   checksum = crc_32(
@@ -1138,9 +1187,28 @@ _pma_verify_checksum(Metadata *meta_page) {
       PMA_PAGE_SIZE);
 
   // Compare checksums
-  return (checksum == _pma_state->metadata.checksum);
+  return (checksum == _pma_state->metadata->checksum);
 }
 
+/**
+ * Sync updates from the dirty page cache in the metadata page to the page
+ * directory
+ *
+ * This sync is technically the *first* step of a new event, since the page
+ * directory for a snapshot is not valid until all of the changes from the dirty
+ * page cache have been applied. The PMA can crash at any moment, therefore
+ * applying the changes to the page directory from the previous event is
+ * required before processing a new one. Note that applying these changes to the
+ * page directory is an idempotent operation - which is good since we could
+ * theoretically crash on the same event repeatedly.
+ *
+ * @param fd              Page directory file descriptor
+ * @param num_dirty_pages Size of dirty page cache
+ * @param dirty_pages     Dirty page cache as array
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_sync_dirty_pages(int fd, uint8_t num_dirty_pages, DirtyPageEntry *dirty_pages) {
   PageStatus  cont_status;
@@ -1152,72 +1220,103 @@ _pma_sync_dirty_pages(int fd, uint8_t num_dirty_pages, DirtyPageEntry *dirty_pag
     init_offset = dirty_pages[i].offset;
     index = dirty_pages[i].index;
 
-    if (_pma_write_page_status(fd, index, dirty_pages[i].status)) goto sync_error;
+    if (_pma_write_page_status(fd, index, dirty_pages[i].status)) return -1;
     // Offset of 0 is code for "leave it alone"
     if (init_offset) {
-      if (_pma_write_page_offset(fd, index, init_offset)) goto sync_error;
+      if (_pma_write_page_offset(fd, index, init_offset)) return -1;
     }
 
-    // The offset on disk doesn't actually matter for the continuation pages of a multi-page allocation, but it does
-    // matter for free page runs: just because two page runs are contiguous in memory, it doesn't mean they are
+    // The offset on disk doesn't actually matter for the continuation pages of
+    // a multi-page allocation, but it does matter for free page runs: just
+    // because two page runs are contiguous in memory, it doesn't mean they are
     // contiguous on disk. An order of events like:
     //
     //    [multi-page allocation] -> [shared-page allocation] -> [multi-page allocation]
     //
-    // could produce a situation where the two multi-page allocations are adjacent in memory, but separated by one
-    // page on disk (because of copy-on-write using a new dpage during the shared page allocation).
+    // could produce a situation where the two multi-page allocations are
+    // adjacent in memory, but separated by one page on disk (because of
+    // copy-on-write using a new dpage during the shared page allocation).
     for (uint32_t j = 1; j < dirty_pages[i].num_pages; ++j) {
-      // XX
       assert((dirty_pages[i].status == FIRST) || (cont_status == FREE));
 
-      if (_pma_write_page_status(fd, (index + j), cont_status)) goto sync_error;
+      if (_pma_write_page_status(fd, (index + j), cont_status)) return -1;
       // Offset of 0 is code for "leave it alone"
       if (init_offset) {
-        if (_pma_write_page_offset(fd, index, (init_offset + (j * PMA_PAGE_SIZE)))) goto sync_error;
+        if (_pma_write_page_offset(fd, index, (init_offset + (j * PMA_PAGE_SIZE)))) return -1;
       }
     }
   }
 
   return 0;
-
-sync_error:
-  return -1;
 }
 
+/**
+ * Update page status of entry in page directory
+ *
+ * @param fd      Page directory file descriptor
+ * @param index   Directory index of entry
+ * @param status  Page status
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_write_page_status(int fd, uint64_t index, PageStatus status) {
   ssize_t bytes_out;
 
-  bytes_out = pwrite(
-      fd,
-      (const void *)&status,
-      sizeof(PageStatus),
-      ((index * sizeof(PageDirEntry)) + sizeof(uint64_t)));
+  do {
+    bytes_out = pwrite(
+        fd,
+        (const void *)&status,
+        sizeof(PageStatus),
+        ((index * sizeof(PageDirEntry)) + sizeof(uint64_t)));
+  } while (!bytes_out);
 
-  if (bytes_out != sizeof(PageStatus)) {
+  if (bytes_out == -1) {
     return -1;
   }
 
   return 0;
 }
 
+/**
+ * Update page offset of entry in page directory
+ *
+ * @param fd      Page directory file descriptor
+ * @param index   Directory index of entry
+ * @param offset  Page offset on disk
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_write_page_offset(int fd, uint64_t index, uint64_t offset) {
   ssize_t bytes_out;
 
-  bytes_out = pwrite(
-      fd,
-      (const void *)&offset,
-      sizeof(uint64_t),
-      (index * sizeof(PageDirEntry)));
+  do {
+    bytes_out = pwrite(
+        fd,
+        (const void *)&offset,
+        sizeof(uint64_t),
+        (index * sizeof(PageDirEntry)));
+  } while (!bytes_out);
 
-  if (bytes_out != sizeof(uint64_t)) {
+  if (bytes_out == -1) {
     return -1;
   }
 
   return 0;
 }
 
+/**
+ * Add newly freed pages and page runs to the free page caches
+ *
+ * @param num_dirty_pages   Size of dirty page cache
+ * @param dirty_pages       Dirty page cache as array
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_update_free_pages(uint8_t num_dirty_pages, DirtyPageEntry *dirty_pages) {
   SinglePageCache  *free_page;
@@ -1228,7 +1327,7 @@ _pma_update_free_pages(uint8_t num_dirty_pages, DirtyPageEntry *dirty_pages) {
     if (dirty_pages[i].status != FREE) continue;
 
     if (dirty_pages[i].num_pages > 1) {
-      page_run = (PageRunCache *)malloc(sizeof(SinglePageCache));
+      page_run = (PageRunCache *)malloc(sizeof(PageRunCache));
       if (page_run == NULL) return -1;
 
       page_run->next = _pma_state->free_page_runs;
@@ -1254,7 +1353,8 @@ _pma_update_free_pages(uint8_t num_dirty_pages, DirtyPageEntry *dirty_pages) {
  *
  * @param size  Size in bytes to allocate (must be <= 1/4 page)
  *
- * @return  The address of the newly allocated memory
+ * @return  NULL    failure; errno set to error code
+ * @return  void*   address of the newly allocated memory
  */
 void *
 _pma_malloc_bytes(size_t size)
@@ -1263,7 +1363,6 @@ _pma_malloc_bytes(size_t size)
   uint16_t          i, slot_size;
   uint8_t           bucket, byte, bit;
 
-  // XX
   assert(size <= PMA_MAX_SHARED_ALLOC);
 
   // Don't bother with anything less than the minimum allocation size
@@ -1278,7 +1377,7 @@ _pma_malloc_bytes(size_t size)
   slot_size = (1 << (bucket + 1));
 
   // Search for a shared page with open slots
-  shared_page = _pma_state->metadata.shared_pages[bucket];
+  shared_page = _pma_state->metadata->shared_pages[bucket];
   while ((shared_page != NULL) && (shared_page->free == 0)) {
     shared_page = shared_page->next;
   }
@@ -1289,7 +1388,7 @@ _pma_malloc_bytes(size_t size)
       return NULL;
     }
 
-    shared_page = _pma_state->metadata.shared_pages[bucket];
+    shared_page = _pma_state->metadata->shared_pages[bucket];
 
   } else {
     if (_pma_copy_shared_page((void *)shared_page)) {
@@ -1297,13 +1396,11 @@ _pma_malloc_bytes(size_t size)
     }
   }
 
-  // XX
   assert(shared_page->free);
 
   // Find first empty slot using bitmap (1 = empty, 0 = full)
   byte = 0;
   while (shared_page->bits[byte] == 0) {
-    // XX
     assert(byte < PMA_BITMAP_SIZE);
     ++byte;
   }
@@ -1332,8 +1429,8 @@ _pma_malloc_bytes(size_t size)
  *                page will go (which also corresponds to the size of the slots
  *                in the page)
  *
- * @return  0 success
- *         -1 failure
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
  */
 int
 _pma_malloc_shared_page(uint8_t bucket)
@@ -1355,8 +1452,8 @@ _pma_malloc_shared_page(uint8_t bucket)
   }
 
   // Add new shared page to top of stack
-  shared_page->next = _pma_state->metadata.shared_pages[bucket];
-  _pma_state->metadata.shared_pages[bucket] = shared_page;
+  shared_page->next = _pma_state->metadata->shared_pages[bucket];
+  _pma_state->metadata->shared_pages[bucket] = shared_page;
 
   return 0;
 }
@@ -1366,7 +1463,8 @@ _pma_malloc_shared_page(uint8_t bucket)
  *
  * @param size  Size in bytes to allocate (must be > 1/4 page)
  *
- * @return  The address of the newly allocated memory
+ * @return  NULL    failure; errno set to error code
+ * @return  void*   address of the newly allocated memory
  */
 void *
 _pma_malloc_pages(size_t size)
@@ -1374,7 +1472,6 @@ _pma_malloc_pages(size_t size)
   void     *address;
   uint64_t  num_pages;
 
-  // XX
   assert(size > PMA_MAX_SHARED_ALLOC);
 
   // Round size up to nearest page boundary
@@ -1390,6 +1487,18 @@ _pma_malloc_pages(size_t size)
   return address;
 }
 
+/**
+ * Allocate a single new page
+ *
+ * Reuse pages from the free page cache, if any are available. These pages are
+ * used for shared allocations and for "large" allocations that are between 1/4
+ * and 1 page in size: (0.25, 1].
+ *
+ * @param status  Page status after allocation (SHARED or FIRST)
+ *
+ * @return  NULL    failure; errno set to error code
+ * @return  void*   address of the newly allocated memory
+ */
 void *
 _pma_malloc_single_page(PageStatus status) {
   void             *address;
@@ -1411,12 +1520,21 @@ _pma_malloc_single_page(PageStatus status) {
     address = _pma_get_new_page(status);
   }
 
-  // XX
   assert((((uint64_t)address) % PMA_PAGE_SIZE) == 0);
 
   return address;
 }
 
+/**
+ * Allocate a contiguous block of multiple pages
+ *
+ * Reuse pages from the free page run cache, if any are available.
+ *
+ * @param num_pages   # pages to allocate
+ *
+ * @return  NULL    failure; errno set to error code
+ * @return  void*   address of the newly allocated memory
+ */
 void *
 _pma_malloc_multi_pages(uint64_t num_pages) {
   void *address;
@@ -1429,6 +1547,17 @@ _pma_malloc_multi_pages(uint64_t num_pages) {
   return address;
 }
 
+/**
+ * Pull existing free pages from the free page run cache
+ *
+ * Does a pass over the entire cache to see if there is an exactly-sized page
+ * run. If so, it's used immediately. Otherwise, keeps track of the smallest
+ * page run that can be split to accommodate the requested allocation.
+ *
+ * @param num_pages   # pages to allocate
+ *
+ * @return  void*   address of the newly allocated memory (NULL if none available)
+ */
 void *
 _pma_get_cached_pages(uint64_t num_pages) {
   PageRunCache *page_run_cache = _pma_state->free_page_runs;
@@ -1496,6 +1625,16 @@ _pma_get_cached_pages(uint64_t num_pages) {
   return address;
 }
 
+/**
+ * Allocate a single new page
+ *
+ * Allocates a new page in virtual memory. May or may not use a new dpage.
+ *
+ * @param status  Page status after allocation (SHARED or FIRST)
+ *
+ * @return  NULL    failure; errno set to error code
+ * @return  void*   address of the newly allocated memory
+ */
 void *
 _pma_get_new_page(PageStatus status) {
   void     *address;
@@ -1509,22 +1648,22 @@ _pma_get_new_page(PageStatus status) {
 
   // Try to map next open memory address to dpage
   address = mmap(
-      _pma_state->metadata.arena_end,
+      _pma_state->metadata->arena_end,
       PMA_PAGE_SIZE,
       PROT_READ | PROT_WRITE,
       MAP_SHARED | MAP_FIXED_NOREPLACE,
       _pma_state->snapshot_fd,
       offset);
   if (address == MAP_FAILED) {
-    address = _pma_state->metadata.arena_end;
-    ERROR("mmap failed");
+    address = _pma_state->metadata->arena_end;
+    WARNING("mmap failed");
+    abort();
   }
 
-  // XX
-  assert(address == _pma_state->metadata.arena_end);
+  assert(address == _pma_state->metadata->arena_end);
 
   // Record PMA expansion
-  _pma_state->metadata.arena_end += PMA_PAGE_SIZE;
+  _pma_state->metadata->arena_end += PMA_PAGE_SIZE;
 
   // Add page to dirty list
   _pma_mark_page_dirty(PTR_TO_INDEX(address), offset, status, 1);
@@ -1532,12 +1671,22 @@ _pma_get_new_page(PageStatus status) {
   return address;
 }
 
+/**
+ * Allocate multiple new pages
+ *
+ * Allocate 2 or more pages in virtual memory. May or may not use new dpages.
+ *
+ * @param num_pages   # pages to allocate
+ *
+ * @return  NULL    failure; errno set to error code
+ * @return  void*   address of the newly allocated memory
+ */
 void *
 _pma_get_new_pages(uint64_t num_pages) {
   void     *address;
   uint64_t  bytes = (num_pages * PMA_PAGE_SIZE);
-  uint64_t  offset = _pma_state->metadata.next_offset;
-  uint64_t  size = _pma_state->metadata.snapshot_size;
+  uint64_t  offset = _pma_state->metadata->next_offset;
+  uint64_t  size = _pma_state->metadata->snapshot_size;
   uint64_t  new_size = (offset + bytes);
 
   // Get new dpages. Extend snapshot backing file first, if necessary.
@@ -1551,23 +1700,23 @@ _pma_get_new_pages(uint64_t num_pages) {
 
   // Try to map dpages to address
   address = mmap(
-      _pma_state->metadata.arena_end,
+      _pma_state->metadata->arena_end,
       bytes,
       PROT_READ | PROT_WRITE,
       MAP_SHARED | MAP_FIXED_NOREPLACE,
       _pma_state->snapshot_fd,
       offset);
   if (address == MAP_FAILED) {
-    address = _pma_state->metadata.arena_end;
-    ERROR("mmap failed");
+    address = _pma_state->metadata->arena_end;
+    WARNING("mmap failed");
+    abort();
   }
 
-  // XX
-  assert(address == _pma_state->metadata.arena_end);
+  assert(address == _pma_state->metadata->arena_end);
 
   // Update offset of next open dpage
-  _pma_state->metadata.next_offset += bytes;
-  _pma_state->metadata.arena_end += bytes;
+  _pma_state->metadata->next_offset += bytes;
+  _pma_state->metadata->arena_end += bytes;
 
   // Add allocated pages to dirty list
   _pma_mark_page_dirty(PTR_TO_INDEX(address), offset, FIRST, num_pages);
@@ -1576,24 +1725,25 @@ _pma_get_new_pages(uint64_t num_pages) {
 }
 
 /**
- * Deallocate one or more pages of allocated memory.
+ * Deallocate one or more pages of allocated memory
  *
  * @param address   Address of block to deallocated
  *
- * @return  Abort if address does not point to start of page
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
  */
-void
+int
 _pma_free_pages(void *address) {
 
   uint32_t index = PTR_TO_INDEX(address);
   uint32_t num_pages = 0;
 
   if ((uint64_t)address & PMA_PAGE_MASK) {
-    ERROR("address does not point to the root of a page");
-    return;
+    WARNING("address does not point to the root of a page");
+    errno = EINVAL;
+    return -1;
   }
 
-  // XX
   assert(_pma_state->page_directory.entries[index].status == FIRST);
 
   // Count number of pages in allocation
@@ -1603,14 +1753,19 @@ _pma_free_pages(void *address) {
 
   // Mark pages dirty
   _pma_mark_page_dirty(index, 0, FREE, num_pages);
+
+  return 0;
 }
 
 /**
  * Deallocate a block of memory in a shared allocation page.
  *
  * @param address   Address of block to deallocated
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
  */
-void
+int
 _pma_free_bytes(void *address) {
   SharedPageHeader *header = (SharedPageHeader *)((uint64_t)address & (~PMA_PAGE_MASK));
   uint8_t           slot = ((((uint64_t)address & PMA_PAGE_MASK) - sizeof(SharedPageHeader)) / (1 << header->size));
@@ -1622,13 +1777,24 @@ _pma_free_bytes(void *address) {
 
   if (header->bits[byte] & (1 << bit)) {
     WARNING("bucketized address already free");
-    return;
+    errno = EINVAL;
+    return -1;
   }
 
   header->bits[byte] += (1 << bit);
   ++header->free;
+
+  return 0;
 }
 
+/**
+ * Copy a shared allocation page
+ *
+ * @param address   Virtual memory address of shared allocation page
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_copy_shared_page(void *address) {
   SharedPageHeader *shared_page;
@@ -1646,8 +1812,11 @@ _pma_copy_shared_page(void *address) {
   }
 
   // Make sure dpage cache is writeable
-  if (!_pma_state->metadata.dpage_cache->dirty) {
-    if (_pma_copy_dpage_cache()) ERROR("dpage cache copy failed");
+  if (!_pma_state->metadata->dpage_cache->dirty) {
+    if (_pma_copy_dpage_cache()) {
+      WARNING("dpage cache copy failed");
+      abort();
+    }
   }
 
   // Copy page
@@ -1659,6 +1828,14 @@ _pma_copy_shared_page(void *address) {
   return 0;
 }
 
+/**
+ * Allocate a new dpage (disk page)
+ *
+ * Reuse a page from the free dpage cache, if any are available.
+ *
+ * @return  0         failure; errno set to error code
+ * @return  uint64_t  offset of new page in backing file
+ */
 uint64_t
 _pma_get_single_dpage(void) {
   uint64_t offset;
@@ -1670,18 +1847,22 @@ _pma_get_single_dpage(void) {
     offset = _pma_get_disk_dpage();
   }
 
-  // XX
   assert((offset % PMA_PAGE_SIZE) == 0);
 
   return offset;
 }
 
+/**
+ * Pull a free dpage from the dpage cache
+ *
+ * @return  offset of new page in backing file (0 if cache empty)
+ */
 uint64_t
 _pma_get_cached_dpage(void) {
   uint64_t offset;
-  uint16_t dirty  = _pma_state->metadata.dpage_cache->dirty;
-  uint16_t size   = _pma_state->metadata.dpage_cache->size;
-  uint16_t head   = _pma_state->metadata.dpage_cache->head;
+  uint16_t dirty  = _pma_state->metadata->dpage_cache->dirty;
+  uint16_t size   = _pma_state->metadata->dpage_cache->size;
+  uint16_t head   = _pma_state->metadata->dpage_cache->head;
 
   // If the cache is empty, or there's only one page in the cache and the cache
   // hasn't been touched yet, then exit early. If the cache hasn't been touched
@@ -1700,39 +1881,45 @@ _pma_get_cached_dpage(void) {
 
   // TODO: macros for dealing with cache?
   // Pop page off queue
-  offset = _pma_state->metadata.dpage_cache->queue[head];
-  _pma_state->metadata.dpage_cache->size -= 1;
-  _pma_state->metadata.dpage_cache->head = ((head + 1) % PMA_DPAGE_CACHE_SIZE);
+  offset = _pma_state->metadata->dpage_cache->queue[head];
+  _pma_state->metadata->dpage_cache->size -= 1;
+  _pma_state->metadata->dpage_cache->head = ((head + 1) % PMA_DPAGE_CACHE_SIZE);
 
-  // XX
-  assert(_pma_state->metadata.dpage_cache->size != -1);
+  assert(_pma_state->metadata->dpage_cache->size != -1);
 
   return offset;
 }
 
+/**
+ * Copy the free dpage cache
+ *
+ * Free dpage cache needs to be copied using copy-on-write semantics when pages
+ * are added or removed.
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_copy_dpage_cache(void) {
   void     *address;
   uint64_t  offset;
-  uint16_t  dirty  = _pma_state->metadata.dpage_cache->dirty;
-  uint16_t  size   = _pma_state->metadata.dpage_cache->size;
-  uint16_t  head   = _pma_state->metadata.dpage_cache->head;
+  uint16_t  dirty  = _pma_state->metadata->dpage_cache->dirty;
+  uint16_t  size   = _pma_state->metadata->dpage_cache->size;
+  uint16_t  head   = _pma_state->metadata->dpage_cache->head;
 
-  // Sanity check
-  // TODO: throw warning?
-  if (dirty) return 0;
+  assert(!dirty);
 
-  address = (void *)_pma_state->metadata.dpage_cache;
+  address = (void *)_pma_state->metadata->dpage_cache;
 
   // If pages available in cache...
   if (size) {
     // Use a page from the cache and record that it was used afterwards
-    offset = _pma_state->metadata.dpage_cache->queue[head];
+    offset = _pma_state->metadata->dpage_cache->queue[head];
 
     _pma_copy_page(address, offset, FIRST, _pma_state->snapshot_fd);
 
-    _pma_state->metadata.dpage_cache->size -= 1;
-    _pma_state->metadata.dpage_cache->head = ((head + 1) % PMA_DPAGE_CACHE_SIZE);
+    _pma_state->metadata->dpage_cache->size -= 1;
+    _pma_state->metadata->dpage_cache->head = ((head + 1) % PMA_DPAGE_CACHE_SIZE);
 
   } else {
     // Otherwise, get a brand new page from disk
@@ -1743,15 +1930,22 @@ _pma_copy_dpage_cache(void) {
   }
 
   // Mark dpage cache dirty (aka writeable)
-  _pma_state->metadata.dpage_cache->dirty = 1;
+  _pma_state->metadata->dpage_cache->dirty = 1;
 
   return 0;
 }
 
+/**
+ * Get a new free dpage on disk
+ *
+ * May require extending the snapshot backing file on disk.
+ *
+ * @return  offset of new page in backing file (0 if failure)
+ */
 uint64_t
 _pma_get_disk_dpage(void) {
-  uint64_t offset = _pma_state->metadata.next_offset;
-  uint64_t size = _pma_state->metadata.snapshot_size;
+  uint64_t offset = _pma_state->metadata->next_offset;
+  uint64_t size = _pma_state->metadata->snapshot_size;
 
   // Get a new dpage. Extend snapshot backing file first, if necessary.
   if (offset == size) {
@@ -1760,22 +1954,27 @@ _pma_get_disk_dpage(void) {
   }
 
   // Update offset of next open dpage
-  _pma_state->metadata.next_offset += PMA_PAGE_SIZE;
+  _pma_state->metadata->next_offset += PMA_PAGE_SIZE;
 
   return offset;
 }
 
+/**
+ * Copy an existing page to a new dpage
+ *
+ * Core copy-on-write implementation.
+ *
+ * @param address   Virtual memory address of existing page
+ * @param offset    Offset of dpage in backing file to which to copy
+ * @param status    Page status after copy (SHARED or FIRST)
+ * @param fd        PMA file descriptor
+ */
 void
 _pma_copy_page(void *address, uint64_t offset, PageStatus status, int fd) {
   void     *new_address;
-  ssize_t   bytes_out;
   uint64_t  index = PTR_TO_INDEX(address);
-  uint16_t  tail = _pma_state->metadata.dpage_cache->tail;
+  uint16_t  tail = _pma_state->metadata->dpage_cache->tail;
 
-  bytes_out = pwrite(fd, address, PMA_PAGE_SIZE, offset);
-  if (bytes_out != PMA_PAGE_SIZE) ERROR("pwrite failed");
-
-  // TODO: is munmap needed here?
   new_address = mmap(
       address,
       PMA_PAGE_SIZE,
@@ -1783,27 +1982,38 @@ _pma_copy_page(void *address, uint64_t offset, PageStatus status, int fd) {
       MAP_SHARED | MAP_FIXED,
       fd,
       offset);
-  if (new_address == MAP_FAILED) ERROR(strerror(errno));
+  if (new_address == MAP_FAILED) {
+    WARNING(strerror(errno));
+    abort();
+  }
 
-  // XX
   assert(new_address == address);
 
   // Add previous dpage to cache
   // Note: the dpage cache should always be writeable here, either because the dpage cache is the page we just copied,
   // or because it was made writeable in advance by _pma_copy_shared_page
-  _pma_state->metadata.dpage_cache->queue[tail] = _pma_state->page_directory.entries[index].offset;
-  _pma_state->metadata.dpage_cache->tail = ((tail + 1) % PMA_DPAGE_CACHE_SIZE);
+  _pma_state->metadata->dpage_cache->queue[tail] = _pma_state->page_directory.entries[index].offset;
+  _pma_state->metadata->dpage_cache->tail = ((tail + 1) % PMA_DPAGE_CACHE_SIZE);
 
   // Add page to dirty page list
   _pma_mark_page_dirty(index, offset, status, 1);
 }
 
+/**
+ * Add entry to the dirty page store
+ *
+ * @param index       Index of page in page directory
+ * @param offset      Offset of page in PMA file
+ * @param status      Status of pages
+ * @param num_pages   Number of pages represented by this entry
+ */
 void
 _pma_mark_page_dirty(uint64_t index, uint64_t offset, PageStatus status, uint32_t num_pages) {
-  DirtyPageEntry *dirty_page = (DirtyPageEntry *)_pma_state->metadata.dirty_pages;
+  DirtyPageEntry *dirty_page = (DirtyPageEntry *)_pma_state->metadata->dirty_pages;
 
-  // TODO: check for dirty page overflow
-  dirty_page += _pma_state->metadata.num_dirty_pages++;
+  dirty_page += _pma_state->metadata->num_dirty_pages++;
+
+  assert(_pma_state->metadata->num_dirty_pages <= PMA_DIRTY_PAGE_LIMIT);
 
   dirty_page->index     = index;
   dirty_page->offset    = offset;
@@ -1811,36 +2021,31 @@ _pma_mark_page_dirty(uint64_t index, uint64_t offset, PageStatus status, uint32_
   dirty_page->num_pages = num_pages;
 }
 
+/**
+ * Extend the size of the PMA backing file on disk
+ *
+ * @param multiplier  New size = old size * multiplier
+ *
+ * @return  0   success
+ * @return  -1  failure; errno set to error code
+ */
 int
 _pma_extend_snapshot_file(uint64_t multiplier) {
+  int bytes;
   int err;
 
   // Update size in metadata
-  _pma_state->metadata.snapshot_size += (multiplier * PMA_SNAP_RESIZE_INC);
+  _pma_state->metadata->snapshot_size += (multiplier * PMA_SNAP_RESIZE_INC);
 
   // Extend snapshot file
-  err = lseek(_pma_state->snapshot_fd, (_pma_state->metadata.snapshot_size - 1), SEEK_SET);
+  err = lseek(_pma_state->snapshot_fd, (_pma_state->metadata->snapshot_size - 1), SEEK_SET);
   if (err == -1) return -1;
-  err = write(_pma_state->snapshot_fd, "", 1);
-  if (err != 1) return -1;
+  do {
+    bytes = write(_pma_state->snapshot_fd, "", 1);
+  } while (!bytes);
+  if (bytes == -1) return -1;
 
   return 0;
-}
-
-/**
- * Log error to console and exit.
- *
- * @param s   Error message
- * @param p   Address which caused error
- * @param l   Line number
- *
- * @return  Always aborts
- */
-void
-_pma_error(const char *s, void *p, int l) {
-   fprintf(stderr, "ERROR %d: %p - %s\n", l, p, s);
-
-   abort();
 }
 
 /**
@@ -1849,12 +2054,8 @@ _pma_error(const char *s, void *p, int l) {
  * @param s   Error message
  * @param p   Address which caused error
  * @param l   Line number
- *
- * @return  Abort if warnings should be treated as errors
  */
 void
 _pma_warning(const char *s, void *p, int l) {
-   if (PMA_ABORT) _pma_error(s, p, l);
-
-   fprintf(stderr, "WARNING %d: %p - %s\n", l, p, s);
+   fprintf(stderr, "*** %d: %p - %s\n", l, p, s);
 }

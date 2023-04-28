@@ -31,8 +31,8 @@
  *
  * Description
  * -----------
- * The source file src/crc32.c contains the routines which are needed to
- * calculate a 32 bit CRC value of a sequence of bytes.
+ * The source file src/includes/checksum.c contains the routines which are
+ * needed to calculate a 32 bit CRC value of a sequence of bytes.
  */
 
 #include <stdbool.h>

@@ -31,8 +31,9 @@
  *
  * Description
  * -----------
- * The headerfile include/checksum.h contains the definitions and prototypes
- * for routines that can be used to calculate several kinds of checksums.
+ * The headerfile src/includes/checksum.h contains the definitions and
+ * prototypes for routines that can be used to calculate several kinds of
+ * checksums.
  */
 
 #ifndef DEF_LIBCRC_CHECKSUM_H
