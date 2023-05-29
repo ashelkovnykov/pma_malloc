@@ -1,0 +1,44 @@
+How does LMDB store data larger than one page?
+    - Overflow pages
+Are these B Trees or B+ trees? Can it actually do sequential access?
+    - MDB_Page with BRANCH/LEAF type forms B Tree
+    - Paper says B+ trees, but it looks like just B trees in the code
+Possible to use B+ trees for storing free pages?
+    - LMDB claims to use B+ trees for runs of free pages, but it appears to use a dynamic array
+Does LMDB update every single B+ tree node on update?
+    - It needs to update the walk up the tree to root for each transaction
+Where is it keeping the old versions of the B+ Tree?
+    - In "cursors"
+    - A cursor (page pointer, key index) tracks the walk from root to a position in the DB, plus associated state
+    - Allocating a new page and changing the page number is only done for the cursor of the current transaction
+        - However, that data gets forwarded to any parent transaction after completion
+    - Other cursors keep the old path with old page numbers
+    - When moving cursor, marks parent pages dirty as it goes
+When does it actually apply data from disk?
+    - B Tree operations (rebalance, search)
+    - Allocate (for write map)
+When does LMDB msync data to the backing file?
+    - Only in mdb_env_sync(), and only if MDB_WRITEMAP is set
+How does LMDB sync data to the backing file, then?
+    - pwrite() to disk
+Where does LMDB call pwrite()?
+    - 3796, mdb_page_flush(), direct call, data
+    - 4257, mdb_env_init_meta(), indirect call, metadata
+    - 4357, mdb_env_write_meta(), direct, metadata
+    - 4377, mdb_env_write_meta(), direct, metadata
+Where does it get the dirty pages in mdb_page_flush()?
+    - txn->mt_u.dirty_list
+Where do pages get added to the transaction dirty list?
+    - 2413, mdb_page_dirty
+        - mdb_page_alloc
+            - mdb_page_touch
+            - mdb_cursor_put
+            - mdb_page_new
+                - mdb_cursor_put
+                - mdb_node_add
+                - mdb_page_split
+        - mdb_page_unspill
+    - 2754, mdb_page_touch
+    - 4021, mdb_txn_commit
+    - 7914, mdb_cursor_put
+
